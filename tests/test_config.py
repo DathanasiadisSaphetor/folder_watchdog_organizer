@@ -2,6 +2,7 @@
 
 import unittest
 import tempfile
+import shutil
 import yaml
 from pathlib import Path
 
@@ -14,6 +15,10 @@ class TestConfig(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        """Clean up test fixtures."""
+        shutil.rmtree(self.test_dir)
 
     def test_default_config(self):
         """Test default configuration."""

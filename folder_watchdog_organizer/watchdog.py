@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Callable
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
+from watchdog.events import FileSystemEventHandler, FileSystemEvent, FileMovedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +39,13 @@ class FileWatchdogHandler(FileSystemEventHandler):
     def on_moved(self, event: FileSystemEvent):
         """Called when a file or directory is moved."""
         if not event.is_directory:
-            logger.debug(f"File moved: {event.src_path} -> {event.dest_path}")
-            self.callback(event.dest_path, 'moved')
+            # For move events, use dest_path from FileMovedEvent
+            if isinstance(event, FileMovedEvent):
+                logger.debug(f"File moved: {event.src_path} -> {event.dest_path}")
+                self.callback(event.dest_path, 'moved')
+            else:
+                logger.debug(f"File moved: {event.src_path}")
+                self.callback(event.src_path, 'moved')
 
 
 class FileWatchdog:
