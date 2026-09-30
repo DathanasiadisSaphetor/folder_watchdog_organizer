@@ -4,6 +4,7 @@ import magic
 import argparse
 import logging
 import os
+import shutil
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_RETENTION_DAYS = 7
@@ -112,107 +113,154 @@ class WatchdogOrganizer:
         ".tmp",
     }
 
+    # libmagic reports most plain-text formats as text/plain (or octet-stream for
+    # unknown binaries). For these generic MIME types, fall back to the extension.
+    GENERIC_MIME_TYPES = {"text/plain", "application/octet-stream"}
+    EXTENSION_CATEGORIES = {
+        ".json": "json",
+        ".py": "python",
+        ".html": "web",
+        ".htm": "web",
+        ".css": "web",
+        ".js": "web",
+        ".csv": "data",
+        ".xml": "data",
+        ".yaml": "data",
+        ".yml": "data",
+        ".sql": "data",
+        ".txt": "documents",
+        ".md": "documents",
+    }
+
     def __init__(self):
         folder_to_watch_env = os.getenv("FOLDER_TO_WATCH", None)
         if not folder_to_watch_env:
             raise ValueError("FOLDER_TO_WATCH environment variable is not set.")
         self.folder_to_watch = Path(folder_to_watch_env)
+        if not self.folder_to_watch.is_dir():
+            raise ValueError(f"FOLDER_TO_WATCH is not a directory: {self.folder_to_watch}")
 
         self.destination_folder = Path(
             os.getenv("DESTINATION_FOLDER", self.folder_to_watch / "Organized")
         )
         self.destination_folders = {
-            "compressed": self.destination_folder / "Compressed",
-            "pictures": self.destination_folder / "Pictures",
-            "json": self.destination_folder / "Json",
-            "python": self.destination_folder / "Python",
-            "web": self.destination_folder / "Web",
-            "documents": self.destination_folder / "Documents",
-            "data": self.destination_folder / "Data",
-            "audio": self.destination_folder / "Audio",
-            "video": self.destination_folder / "Video",
-            "executables": self.destination_folder / "Executables",
+            key: self.destination_folder / key.capitalize() for key in self.MIME_TYPES
         }
 
     def is_safe_to_move_from_desktop(self, file_path: str | Path) -> bool:
         path = Path(file_path)
 
-        # 1. Ignore if it's a directory (unless you want to move whole folders)
-        if not path.is_file():
-            return False
-
-        # 2. Check exact system file names
-        if path.name.lower() in self.DESKTOP_SYSTEM_FILES:
-            return False
-
-        # 3. Check for specific ignored extensions
-        if path.suffix.lower() in self.IGNORED_EXTENSIONS:
-            return False
-
-        # 4. Ignore hidden files (starts with dot)
-        # This automatically catches .DS_Store, .localized, etc., but it's good to be explicit above
-        if path.name.startswith("."):
-            return False
-
-        # 5. Ignore Microsoft Office lock files (they start with ~$)
-        if path.name.startswith("~$"):
-            return False
-
-        # 6. Ignore symlinks (macOS/Linux aliases)
+        # Check symlinks first: is_file() follows links, so a link to a file
+        # would otherwise pass.
         if path.is_symlink():
             return False
-
+        if not path.is_file():
+            return False
+        name = path.name.lower()
+        if name in self.DESKTOP_SYSTEM_FILES:
+            return False
+        if path.suffix.lower() in self.IGNORED_EXTENSIONS:
+            return False
+        # Hidden files and Microsoft Office lock files (~$)
+        if name.startswith(".") or name.startswith("~$"):
+            return False
         return True
 
-    def determine_mime_types(self, args) -> dict[str, set[str]]:
-        if args.all is True:
-            return self.MIME_TYPES
+    def determine_categories(self, args) -> list[str]:
+        """Categories selected by the CLI flags, minus any --exclude-* flags."""
+        selected = [key for key in self.MIME_TYPES if getattr(args, key, False)]
+        excluded = {
+            key for key in self.MIME_TYPES if getattr(args, f"exclude_{key}", False)
+        }
+        # --all, or only exclusions given -> start from every category
+        if args.all or (not selected and excluded):
+            selected = list(self.MIME_TYPES)
+        return [key for key in selected if key not in excluded]
 
-        mime_types = {}
-        args_dict = vars(args)
-        for arg in args_dict:
-            if arg == "dry_run":
+    def classify(self, path: Path) -> str | None:
+        mime = magic.from_file(str(path), mime=True)
+        if mime in self.GENERIC_MIME_TYPES:
+            return self.EXTENSION_CATEGORIES.get(path.suffix.lower())
+        for category, mime_types in self.MIME_TYPES.items():
+            if mime in mime_types:
+                return category
+        return None
+
+    @staticmethod
+    def unique_destination(target: Path, reserved: set[Path]) -> Path:
+        """name.ext -> name_1.ext -> name_2.ext ... until free on disk and in this batch."""
+        candidate = target
+        counter = 1
+        while candidate.exists() or candidate in reserved:
+            candidate = target.with_name(f"{target.stem}_{counter}{target.suffix}")
+            counter += 1
+        return candidate
+
+    def build_plan(self, categories: list[str]) -> list[tuple[Path, Path]]:
+        """Scan, classify and resolve destinations. Touches nothing on disk.
+
+        Any exception here aborts the run before a single file is moved.
+        """
+        plan: list[tuple[Path, Path]] = []
+        reserved: set[Path] = set()
+        wanted = set(categories)
+
+        for f in sorted(self.folder_to_watch.iterdir()):
+            if not self.is_safe_to_move_from_desktop(f):
+                if f.is_file():
+                    logging.info(f"Skipping {f.name}: not safe to relocate.")
                 continue
-            mime_types[arg] = self.MIME_TYPES.get(arg, {})
-
-        return mime_types
-
-    def fetch_all_files(
-        self, folder: Path, mime_types: dict[str, set[str]]
-    ) -> dict[str, set[Path]]:
-        result = {key: set() for key in mime_types}
-        for f in folder.iterdir():
-            if not f.is_file():
+            category = self.classify(f)
+            if category not in wanted:
                 continue
-            file_type = magic.from_file(str(f), mime=True)
-            for category, mime_types_set in mime_types.items():
-                if file_type in mime_types_set:
-                    result[category].add(f)
-                    logging.info(
-                        f"{category} file found: {f.name}.\t-->\t{'SAFE' if self.is_safe_to_move_from_desktop(f) else 'NOT SAFE'}"
-                    )
-                    break
-        return result
+            destination = self.unique_destination(
+                self.destination_folders[category] / f.name, reserved
+            )
+            reserved.add(destination)
+            plan.append((f, destination))
+            logging.info(f"[{category}] {f.name}\t-->\t{destination}")
+        return plan
 
-    def move_files(self, files: set[Path], file_type: str):
-        for f in files:
-            # TODO this checks only the desktop folder.
-            # more checks to be added
-            if not self.is_safe_to_move_from_desktop(file_path=f):
-                logging.warning(f"Skipped file {f.name}. It is not safe to relocate.")
-                continue
-            destination = self.destination_folders[file_type] / f.name
-            destination.parent.mkdir(exist_ok=True)
-            f.rename(destination)
-            logging.info(f"Moved file {f.name} to {destination}")
+    @staticmethod
+    def execute_plan(plan: list[tuple[Path, Path]]):
+        """Move every file in the plan; on any failure, roll back the moves done so far."""
+        # Create destination folders first so a mkdir failure happens before any move.
+        for parent in {dst.parent for _, dst in plan}:
+            parent.mkdir(parents=True, exist_ok=True)
+
+        done: list[tuple[Path, Path]] = []
+        try:
+            for src, dst in plan:
+                # Something may have appeared since planning; never overwrite.
+                if dst.exists():
+                    raise FileExistsError(f"Destination appeared during run: {dst}")
+                shutil.move(src, dst)  # works across filesystems, unlike Path.rename
+                done.append((src, dst))
+                logging.info(f"Moved {src.name} to {dst}")
+        except Exception:
+            logging.exception("Move failed; rolling back files moved in this run.")
+            for src, dst in reversed(done):
+                try:
+                    shutil.move(dst, src)
+                    logging.info(f"Restored {src}")
+                except Exception:
+                    logging.exception(f"ROLLBACK FAILED: {dst} could not be restored to {src}")
+            raise
 
     def move(self, args):
-        mime_types = self.determine_mime_types(args)
-        all_files = self.fetch_all_files(self.folder_to_watch, mime_types)
-        if not args.dry_run:
-            for key in mime_types:
-                if args.all or getattr(args, key, False):
-                    self.move_files(all_files[key], key)
+        categories = self.determine_categories(args)
+        if not categories:
+            logging.warning("No categories selected. Use --all or --<category>.")
+            return
+        plan = self.build_plan(categories)
+        if not plan:
+            logging.info("Nothing to move.")
+            return
+        if args.dry_run:
+            logging.info(f"Dry run: {len(plan)} file(s) would be moved.")
+            return
+        self.execute_plan(plan)
+        logging.info(f"Done: {len(plan)} file(s) moved.")
 
 
 if __name__ == "__main__":
@@ -222,13 +270,13 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--all",
         action="store_true",
-        help="Move all file types, ignoring other type arguments.",
+        help="Move all file types (combine with --exclude-* to skip some).",
     )
     for key in WatchdogOrganizer.MIME_TYPES:
         argparser.add_argument(
             f"--{key}",
             action="store_true",
-            help=f"Move only {key} files.",
+            help=f"Move {key} files.",
         )
         argparser.add_argument(
             f"--exclude-{key}",
@@ -243,5 +291,9 @@ if __name__ == "__main__":
     args = argparser.parse_args()
 
     setup_logging()
-    organizer = WatchdogOrganizer()
-    organizer.move(args)
+    try:
+        organizer = WatchdogOrganizer()
+        organizer.move(args)
+    except Exception:
+        logging.exception("Aborted.")
+        raise SystemExit(1)
